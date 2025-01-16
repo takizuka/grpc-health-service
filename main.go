@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
-	"google.golang.org/grpc/reflection"
-	"log"
-	"net"
-
+	"errors"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc/filters"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/examples/features/proto/echo"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
+	"log"
+	"net"
 )
 
 // HealthService implements the gRPC health checking service.
@@ -47,18 +52,59 @@ type EchoService struct {
 	echo.UnimplementedEchoServer
 }
 
-// Echo returns the same message sent by the client.
-func (e *EchoService) Echo(ctx context.Context, req *echo.EchoRequest) (*echo.EchoResponse, error) {
+// UnaryEcho returns the same message sent by the client.
+func (e *EchoService) UnaryEcho(ctx context.Context, req *echo.EchoRequest) (*echo.EchoResponse, error) {
 	return &echo.EchoResponse{Message: req.GetMessage()}, nil
 }
 
+func setupOpenTelemetry(ctx context.Context) (shutdown func(context.Context) error, err error) {
+	var shutdownFuncs []func(context.Context) error
+	shutdown = func(ctx context.Context) error {
+		var err error
+		for _, fn := range shutdownFuncs {
+			err = errors.Join(err, fn(ctx))
+		}
+		shutdownFuncs = nil
+		return err
+	}
+
+	exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+	if err != nil {
+		err = errors.Join(err, shutdown(ctx))
+		return
+	}
+
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exporter),
+	)
+	shutdownFuncs = append(shutdownFuncs, tp.Shutdown)
+	otel.SetTracerProvider(tp)
+
+	return shutdown, nil
+}
+
 func main() {
+	ctx := context.Background()
+
 	listener, err := net.Listen("tcp", ":50051")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	server := grpc.NewServer()
+	shutdown, err := setupOpenTelemetry(ctx)
+	if err != nil {
+		log.Fatalf("error setting up OpenTelemetry: %v", err)
+	}
+
+	server := grpc.NewServer(
+		grpc.StatsHandler(
+			otelgrpc.NewServerHandler(
+				otelgrpc.WithFilter(
+					filters.Not(filters.HealthCheck()),
+				),
+			),
+		),
+	)
 
 	// メインのサービスの登録
 	echoServer := &EchoService{}
@@ -72,9 +118,7 @@ func main() {
 	reflection.Register(server)
 
 	log.Println("gRPC server is running on port 50051")
-	if err := server.Serve(listener); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+	if err := errors.Join(server.Serve(listener), shutdown(ctx)); err != nil {
+		log.Fatalf("server exited with error: %v", err)
 	}
-
-	// 商用サービスならグレースフルシャットダウンなどの実装が必要
 }
